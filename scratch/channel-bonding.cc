@@ -150,6 +150,8 @@ uint16_t primaryChannelBss=36;
   std::string mcs6 = "IdealWifi";
   std::string mcs7 = "IdealWifi";
 
+  double ccaSdThreshold = -82.0;
+
   double ccaEdThresholdPrimaryBss = -62.0;
   double constantCcaEdThresholdSecondaryBss = -62.0;
   double ccaEdThresholdPrimaryBssA = -62.0;
@@ -227,6 +229,10 @@ uint16_t primaryChannelBss=36;
   cmd.AddValue ("channelBondingType",
                 "The channel bonding type: Static, ConstantThreshold or DynamicThreshold",
                 channelBondingType);
+
+  cmd.AddValue ("ccaSdThreshold",
+                "The Wifi signal detection threshold",
+                ccaSdThreshold);
 
   cmd.AddValue ("ccaEdThresholdPrimaryBssA",
                 "The energy detection threshold on the primary channel for BSS A",
@@ -893,6 +899,7 @@ InterferenceVal7=maxSecInterference7;
   SpectrumWifiPhyHelper phy = SpectrumWifiPhyHelper::Default ();
   phy.Set ("TxPowerStart", DoubleValue (TxP));
   phy.Set ("TxPowerEnd", DoubleValue (TxP));
+  phy.SetPreambleDetectionModel ("ns3::ThresholdPreambleDetectionModel","Threshold", DoubleValue (ccaSdThreshold + 94));
 
   Ptr<MultiModelSpectrumChannel> channel = CreateObject<MultiModelSpectrumChannel> ();
   Ptr<LogDistancePropagationLossModel> lossModel = CreateObject<LogDistancePropagationLossModel> ();
@@ -2018,12 +2025,13 @@ phy.EnablePcap ("apC_pcap", apDeviceC);
 
   double rxThroughputPerNode[numNodes];
   // output for all nodes
-  for (uint32_t k = 0; k < numNodes; k++)
+  
+  for (uint32_t k = 0; k < 4; k++) // k < numNodes to k < 4
     {
       double bitsReceived = bytesReceived[k] * 8;
       rxThroughputPerNode[k] = static_cast<double> (bitsReceived) / 1e6 / simulationTime;
-      std::cout << "Node " << k << ", pkts " << packetsReceived[k] << ", bytes " << bytesReceived[k]
-                << ", throughput [MMb/s] " << rxThroughputPerNode[k] << std::endl;
+      std::cout << "Node, " << k << ", pkts, " << packetsReceived[k] << ", bytes, " << bytesReceived[k]
+                << ", throughput [MMb/s], " << rxThroughputPerNode[k] << std::endl;
           TputFile << rxThroughputPerNode[k] << std::endl;
 
     }
