@@ -36,6 +36,19 @@
 #include "ns3/wifi-net-device.h"
 #include "ns3/random-variable-stream.h"
 #include "ns3/wifi-utils.h"
+#include <iostream>
+#include <iomanip>
+#include <ns3/core-module.h>
+#include <ns3/config-store-module.h>
+#include <ns3/network-module.h>
+#include <ns3/mobility-module.h>
+#include <ns3/internet-module.h>
+#include <ns3/wifi-module.h>
+#include <ns3/spectrum-module.h>
+#include <ns3/applications-module.h>
+#include <ns3/propagation-module.h>
+#include <ns3/flow-monitor-module.h>
+#include <ns3/flow-monitor-helper.h>
 
 // for tracking packets and bytes received. will be reallocated once we finalize
 // number of nodes
@@ -43,77 +56,22 @@ std::vector<uint64_t> packetsReceived (0);
 std::vector<uint64_t> bytesReceived (0);
 double expn = 3.5, Pref = -30, Pn = -94, TxP = 20;
 
+std::vector<std::vector<uint64_t> > packetsReceivedPerNode;
+std::vector<std::vector<double> > rssiPerNode;
+
 using namespace ns3;
 
 NS_LOG_COMPONENT_DEFINE ("WifiChannelBonding");
 // Parse context strings of the form "/NodeList/3/DeviceList/1/Mac/Assoc"
 // to extract the NodeId
-uint32_t
-ContextToNodeId (std::string context)
-{
-  std::string sub = context.substr (10); // skip "/NodeList/"
-  uint32_t pos = sub.find ("/Device");
-  uint32_t nodeId = atoi (sub.substr (0, pos).c_str ());
-  NS_LOG_DEBUG ("Found NodeId " << nodeId);
-  return nodeId;
-}
-void
-AddClient (ApplicationContainer &clientApps, Ipv4Address address, Ptr<Node> node, uint16_t port,
-           Time interval, uint32_t payloadSize)
-{
-  UdpClientHelper client (address, port);
-  client.SetAttribute ("Interval", TimeValue (interval));
-  client.SetAttribute ("MaxPackets", UintegerValue (4294967295u));
-  client.SetAttribute ("PacketSize", UintegerValue (payloadSize));
-  clientApps.Add (client.Install (node));
-}
 
-
-  double reqSinrPerMcs[12] = {0.7, 3.7, 6.2, 9.3, 12.6, 16.8, 18.2, 19.4, 23.5, 30, 35, 40};
-uint16_t
-selectMCS (Vector v, double InterferenceVal)
-{
-
-  uint8_t i = 0;
-  double SNR = Pref - expn * 10 / 2 * log10 (v.x * v.x + v.y * v.y + v.z * v.z) - WToDbm(DbmToW(InterferenceVal)+DbmToW(Pn)) - 10;
-//std::cout<<WToDbm(DbmToW(InterferenceVal)+DbmToW(Pn)) <<std::endl;
-//std::cout<<SNR<<std::endl;
-  for (i = 0; i < 9; i++)
-    {
-      if (reqSinrPerMcs[i] > SNR)
-        {
-          break;
-        }
-    }
-  if (i > 0)
-    {
-      i = i - 1;
-    }
-//std::cout<<+i<<std::endl;
-  return i;
-
-}
-
-void
-AddServer (ApplicationContainer &serverApps, UdpServerHelper &server, Ptr<Node> node)
-{
-  serverApps.Add (server.Install (node));
-}
-
-void
-PacketRx (std::string context, const Ptr<const Packet> p, const Address &srcAddress,
-          const Address &destAddress)
-{
-  uint32_t nodeId = ContextToNodeId (context);
-  uint32_t pktSize = p->GetSize ();
-  bytesReceived[nodeId] += pktSize;
-  packetsReceived[nodeId]++;
-}
-
-int
-main (int argc, char *argv[])
-{
-
+  uint16_t n = 1;
+  uint16_t nBss = 1;
+uint32_t nEstablishedAddaBa = 0;
+bool allAddBaEstablished = false;
+Time timeAllAddBaEstablished;
+Time timeLastPacketReceived;
+bool filterOutNonAddbaEstablished = false;
 
   uint32_t payloadSize = 1472; // bytes
   double simulationTime = 20; // seconds
@@ -169,6 +127,12 @@ uint16_t primaryChannelBss=36;
   double ccaEdThresholdPrimaryBssG = -62.0;
   double constantCcaEdThresholdSecondaryBssG = -62.0;
 
+  std::string channelBondingType = "ConstantThreshold";
+  std::string Test = "";
+
+
+  uint32_t maxMissedBeacons = 4294967295;
+
   double aggregateDownlinkAMbps = 0;
   double aggregateDownlinkBMbps = 0;
   double aggregateDownlinkCMbps = 0;
@@ -186,12 +150,327 @@ uint16_t primaryChannelBss=36;
   double aggregateUplinkFMbps = 0;
   double aggregateUplinkGMbps = 0;
 
-  std::string channelBondingType = "ConstantThreshold";
-  std::string Test = "";
 
-  uint16_t n = 1;
-  uint16_t nBss = 1;
-  uint32_t maxMissedBeacons = 4294967295;
+ApplicationContainer uplinkServerApps;
+ApplicationContainer downlinkServerApps;
+ApplicationContainer uplinkClientApps;
+ApplicationContainer downlinkClientApps;
+
+NodeContainer allNodes;
+
+uint32_t nAssociatedStas = 0;
+bool allStasAssociated = false;
+std::vector<uint32_t> nAssociatedStasPerBss (0);
+
+struct SignalArrival
+{
+  Time m_time;
+  Time m_duration;
+  bool m_wifi;
+  uint32_t m_nodeId;
+  uint32_t m_senderNodeId;
+  double m_power;
+};
+uint32_t
+ContextToNodeId (std::string context)
+{
+  std::string sub = context.substr (10); // skip "/NodeList/"
+  uint32_t pos = sub.find ("/Device");
+  uint32_t nodeId = atoi (sub.substr (0, pos).c_str ());
+  NS_LOG_DEBUG ("Found NodeId " << nodeId);
+  return nodeId;
+}
+void
+AddClient (ApplicationContainer &clientApps, Ipv4Address address, Ptr<Node> node, uint16_t port,
+           Time interval, uint32_t payloadSize)
+{
+  UdpClientHelper client (address, port);
+  client.SetAttribute ("Interval", TimeValue (interval));
+  client.SetAttribute ("MaxPackets", UintegerValue (4294967295u));
+  client.SetAttribute ("PacketSize", UintegerValue (payloadSize));
+  clientApps.Add (client.Install (node));
+}
+
+
+  double reqSinrPerMcs[12] = {0.7, 3.7, 6.2, 9.3, 12.6, 16.8, 18.2, 19.4, 23.5, 30, 35, 40};
+uint16_t
+selectMCS (Vector v, double InterferenceVal)
+{
+
+  uint8_t i = 0;
+  double SNR = Pref - expn * 10 / 2 * log10 (v.x * v.x + v.y * v.y + v.z * v.z) - WToDbm(DbmToW(InterferenceVal)+DbmToW(Pn)) - 10;
+//std::cout<<WToDbm(DbmToW(InterferenceVal)+DbmToW(Pn)) <<std::endl;
+//std::cout<<SNR<<std::endl;
+  for (i = 0; i < 9; i++)
+    {
+      if (reqSinrPerMcs[i] > SNR)
+        {
+          break;
+        }
+    }
+  if (i > 0)
+    {
+      i = i - 1;
+    }
+//std::cout<<+i<<std::endl;
+  return i;
+
+}
+
+void
+AddServer (ApplicationContainer &serverApps, UdpServerHelper &server, Ptr<Node> node)
+{
+  serverApps.Add (server.Install (node));
+}
+
+void
+AddbaStateCb (std::string context, Time t, Mac48Address recipient, uint8_t tid, OriginatorBlockAckAgreement::State state)
+{
+  bool isAp = false;
+  for (uint32_t bss = 1; bss <= nBss; bss++)
+  {
+    if (ContextToNodeId (context) == (((bss - 1) * n) + bss - 1))
+    {
+      isAp = true;
+    }
+  }
+  if (state == OriginatorBlockAckAgreement::ESTABLISHED)
+    {
+      if ((aggregateDownlinkAMbps != 0) && (aggregateUplinkAMbps != 0)) //UP + DL
+        {
+          nEstablishedAddaBa++;
+          if (nEstablishedAddaBa == 2 * n * nBss)
+            {
+              allAddBaEstablished = true;
+              timeAllAddBaEstablished = t;
+              if (filterOutNonAddbaEstablished)
+                {
+                  Simulator::Stop (Seconds (simulationTime));
+                  for (auto it = uplinkClientApps.Begin (); it != uplinkClientApps.End (); ++it)
+                    {
+                      Ptr<UdpClient> client = DynamicCast<UdpClient> (*it);
+                      client->SetAttribute ("MaxPackets", UintegerValue (4294967295u));
+                    }
+                  for (auto it = downlinkClientApps.Begin (); it != downlinkClientApps.End (); ++it)
+                    {
+                      Ptr<UdpClient> client = DynamicCast<UdpClient> (*it);
+                      client->SetAttribute ("MaxPackets", UintegerValue (4294967295u));
+                    }
+                }
+            }
+        }
+      else if (((aggregateDownlinkAMbps != 0) && isAp) || ((aggregateUplinkAMbps != 0) && !isAp)) //UL or DL
+        {
+          nEstablishedAddaBa++;
+          if (nEstablishedAddaBa == n * nBss)
+            {
+              allAddBaEstablished = true;
+              timeAllAddBaEstablished = t;
+              if (filterOutNonAddbaEstablished)
+                {
+                  Simulator::Stop (Seconds (simulationTime));
+                  for (auto it = uplinkClientApps.Begin (); it != uplinkClientApps.End (); ++it)
+                    {
+                      Ptr<UdpClient> client = DynamicCast<UdpClient> (*it);
+                      client->SetAttribute ("MaxPackets", UintegerValue (4294967295u));
+                    }
+                  for (auto it = downlinkClientApps.Begin (); it != downlinkClientApps.End (); ++it)
+                    {
+                      Ptr<UdpClient> client = DynamicCast<UdpClient> (*it);
+                      client->SetAttribute ("MaxPackets", UintegerValue (4294967295u));
+                    }
+                }
+            }
+        }
+    }
+  else if (state == OriginatorBlockAckAgreement::RESET)
+    {
+      //Make sure ADDBA establishment will be restarted
+      Ptr<UdpClient> client;
+      if (isAp && (aggregateDownlinkAMbps != 0))
+        {
+          //TODO: only do this for the recipient
+          for (uint32_t i = 0; i < n; i++)
+            {
+              client = DynamicCast<UdpClient> (allNodes.Get (ContextToNodeId (context))->GetApplication (i));
+              NS_ASSERT (client != 0);
+              client->SetAttribute ("MaxPackets", UintegerValue (1));
+            }
+        }
+      if (!isAp && (aggregateUplinkAMbps != 0))
+        {
+          client = DynamicCast<UdpClient> (allNodes.Get (ContextToNodeId (context))->GetApplication (0));
+          NS_ASSERT (client != 0);
+          client->SetAttribute ("MaxPackets", UintegerValue (1));
+        }
+    }
+//std::cout<<"Addbacb"<<std::endl;
+}
+
+void
+StaAssocCb (std::string context, Mac48Address bssid)
+{
+  uint32_t nodeId = ContextToNodeId (context);
+  uint32_t appId = 0;
+  uint32_t bss = 1;
+  // Determine application ID from node ID
+  for (; bss <= nBss; bss++)
+    {
+      if (nodeId <= (bss * n) + bss - 1)
+        {
+          appId = nodeId - bss;
+          break;
+        }
+    }
+  nAssociatedStasPerBss[bss - 1]++;
+  if (nAssociatedStasPerBss[bss - 1] == n)
+/* error: ‘apDeviceA’ was not declared in this scope brabra...
+   {
+      // All STAs of this BSS are associated, we can extend beacon interval if bianchi flag is enabled
+      Ptr<WifiNetDevice> apDevice;
+      if (bss == 1)
+        {
+          apDevice = apDeviceA.Get (0)->GetObject<WifiNetDevice> ();
+        }
+      else if (bss == 2)
+        {
+          apDevice = apDeviceB.Get (0)->GetObject<WifiNetDevice> ();
+        }
+      else if (bss == 3)
+        {
+          apDevice = apDeviceC.Get (0)->GetObject<WifiNetDevice> ();
+        }
+      else if (bss == 4)
+        {
+          apDevice = apDeviceD.Get (0)->GetObject<WifiNetDevice> ();
+        }
+      else if (bss == 5)
+        {
+          apDevice = apDeviceE.Get (0)->GetObject<WifiNetDevice> ();
+        }
+      else if (bss == 6)
+        {
+          apDevice = apDeviceF.Get (0)->GetObject<WifiNetDevice> ();
+        }
+      else //bss == 7
+        {
+          apDevice = apDeviceG.Get (0)->GetObject<WifiNetDevice> ();
+        }
+      Ptr<ApWifiMac> apWifiMac = apDevice->GetMac ()->GetObject<ApWifiMac> ();
+      apWifiMac->SetAttribute ("BeaconInterval", TimeValue (MicroSeconds (beaconInterval)));
+    }*/
+  if (filterOutNonAddbaEstablished)
+    {
+      // Here, we make sure that there is at least one packet in the queue after association (paquets queued before are dropped)
+      Ptr<UdpClient> client;
+      if (aggregateUplinkAMbps != 0)
+        {
+          client = DynamicCast<UdpClient> (uplinkClientApps.Get(appId));
+          client->SetAttribute ("MaxPackets", UintegerValue (1));
+        }
+      if (aggregateDownlinkAMbps != 0)
+        {
+          client = DynamicCast<UdpClient> (downlinkClientApps.Get(appId));
+          client->SetAttribute ("MaxPackets", UintegerValue (1));
+        }
+    }
+  nAssociatedStas++;
+  if (nAssociatedStas == (n * nBss))
+    {
+      allStasAssociated = true;
+      if (!filterOutNonAddbaEstablished)
+        {
+          Simulator::Stop (Seconds (simulationTime));
+        }
+    }
+}
+
+void
+SaveSpatialReuseStats (const std::string filename)
+{
+  std::ofstream outFile;
+  outFile.open (filename.c_str (), std::ofstream::out | std::ofstream::trunc);
+  outFile.setf (std::ios_base::fixed);
+  outFile.flush ();
+
+  if (!outFile.is_open ())
+    {
+      NS_LOG_ERROR ("Can't open file " << filename);
+      return;
+    }
+
+  uint32_t numNodes = packetsReceived.size ();
+
+
+  
+ 
+  outFile << "Avg. RSSI:" << std::endl;
+  for (uint32_t rxNodeId = 0; rxNodeId < numNodes; rxNodeId++)
+    {
+      for (uint32_t txNodeId = 0; txNodeId < numNodes; txNodeId++)
+        {
+          uint64_t pkts = packetsReceivedPerNode[rxNodeId][txNodeId];
+          double rssi = rssiPerNode[rxNodeId][txNodeId];
+          double avgRssi = 0.0;
+          if (pkts > 0)
+            {
+              avgRssi = rssi / pkts;
+            }
+          outFile << avgRssi << "  ";
+        }
+      outFile << std::endl;
+    }
+
+
+  outFile.close ();
+
+  std::cout << "Spatial Reuse Stats written to: " << filename << std::endl;
+
+}
+void
+PacketRx (std::string context, const Ptr<const Packet> p, const Address &srcAddress,
+          const Address &destAddress)
+{
+  uint32_t nodeId = ContextToNodeId (context);
+  uint32_t pktSize = p->GetSize ();
+  bytesReceived[nodeId] += pktSize;
+  packetsReceived[nodeId]++;
+}
+bool g_logArrivals = false;
+std::vector<SignalArrival> g_arrivals;
+double g_arrivalsDurationCounter = 0;
+
+void
+SignalCb (std::string context, bool wifi, uint32_t senderNodeId, double rxPowerDbm, Time rxDuration)
+{
+  if (g_logArrivals)
+    {
+      SignalArrival arr;
+      arr.m_time = Simulator::Now ();
+      arr.m_duration = rxDuration;
+      arr.m_nodeId = ContextToNodeId (context);
+      arr.m_senderNodeId = senderNodeId;
+      arr.m_wifi = wifi;
+      arr.m_power = rxPowerDbm;
+      g_arrivals.push_back (arr);
+      g_arrivalsDurationCounter += rxDuration.GetSeconds ();
+    }
+
+  NS_LOG_DEBUG (context << " " << wifi << " " << senderNodeId << " " << rxPowerDbm << " " << rxDuration.GetSeconds () / 1000.0);
+  uint32_t nodeId = ContextToNodeId (context);
+
+  packetsReceivedPerNode[nodeId][senderNodeId] += 1;
+  rssiPerNode[nodeId][senderNodeId] += rxPowerDbm;
+//std::cout<<"Side "<<std::endl;
+}
+
+
+int
+main (int argc, char *argv[])
+{
+
+
+
   CommandLine cmd;
 
   cmd.AddValue ("payloadSize", "Payload size in bytes", payloadSize);
@@ -370,6 +649,7 @@ NodeContainer wifiStaNodes;
   double perNodeDownlinkGMbps = aggregateDownlinkGMbps / n;
   Time intervalUplinkG = MicroSeconds (payloadSize * 8 / perNodeUplinkGMbps);
   Time intervalDownlinkG = MicroSeconds (payloadSize * 8 / perNodeDownlinkGMbps);
+
 
   wifiStaNodesA.Create (n);
 
@@ -2005,9 +2285,23 @@ phy.EnablePcap ("apB_pcap", apDeviceB);
 phy.EnablePcap ("staC_pcap", staDeviceC);
 phy.EnablePcap ("apC_pcap", apDeviceC);
 */
+  Config::Connect ("/NodeList/*/DeviceList/*/$ns3::WifiNetDevice/Phy/$ns3::SpectrumWifiPhy/SignalArrival", MakeCallback (&SignalCb));
+  Config::Connect ("/NodeList/*/DeviceList/*/$ns3::WifiNetDevice/Mac/$ns3::RegularWifiMac/BE_Txop/BlockAckManager/AgreementState", MakeCallback (&AddbaStateCb));
+  Config::Connect ("/NodeList/*/DeviceList/*/$ns3::WifiNetDevice/Mac/$ns3::StaWifiMac/Assoc", MakeCallback (&StaAssocCb));
 
   Simulator::Stop (Seconds (simulationTime + 1));
+std::cout<<"Mark 1"<<std::endl;
   Simulator::Run ();
+std::cout<<"Mark 2"<<std::endl;
+
+  Config::Disconnect ("/NodeList/*/DeviceList/*/$ns3::WifiNetDevice/Phy/$ns3::SpectrumWifiPhy/SignalArrival", MakeCallback (&SignalCb));
+  Config::Disconnect ("/NodeList/*/DeviceList/*/$ns3::WifiNetDevice/Mac/$ns3::RegularWifiMac/BE_Txop/BlockAckManager/AgreementState", MakeCallback (&AddbaStateCb));
+  Config::Disconnect ("/NodeList/*/DeviceList/*/$ns3::WifiNetDevice/Mac/$ns3::StaWifiMac/Assoc", MakeCallback (&StaAssocCb));
+
+  // Save spatial reuse statistics to an output file
+//  SaveSpatialReuseStats ("RSSI_file.dat");
+
+
 
   Simulator::Destroy ();
   // allocate in the order of AP_A, STAs_A, AP_B, STAs_B
